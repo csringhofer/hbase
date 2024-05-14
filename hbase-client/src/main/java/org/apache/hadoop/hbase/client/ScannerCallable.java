@@ -92,6 +92,7 @@ public class ScannerCallable extends ClientServiceCallable<Result[]> {
   // indicate if it is a remote server call
   protected boolean isRegionServerRemote = true;
   private long nextCallSeq = 0;
+  private long lastCallSeq = -1;
   protected final RpcControllerFactory rpcControllerFactory;
 
   /**
@@ -173,9 +174,11 @@ public class ScannerCallable extends ClientServiceCallable<Result[]> {
       this.scanMetrics != null, renew, scan.getLimit());
     try {
       ScanResponse response = getStub().scan(getRpcController(), request);
+      lastCallSeq = nextCallSeq;
       nextCallSeq++;
       return response;
     } catch (Exception e) {
+      lastCallSeq = nextCallSeq;
       IOException ioe = ProtobufUtil.handleRemoteException(e);
       if (logScannerActivity) {
         LOG.info(
@@ -238,9 +241,11 @@ public class ScannerCallable extends ClientServiceCallable<Result[]> {
       return null;
     }
     ScanResponse response;
+    boolean isRetry = false;
     if (this.scannerId == -1L) {
       response = openScanner();
     } else {
+      if (lastCallSeq == nextCallSeq) isRetry = true;
       response = next();
     }
     long timestamp = System.currentTimeMillis();
@@ -250,14 +255,19 @@ public class ScannerCallable extends ClientServiceCallable<Result[]> {
       cursor = ProtobufUtil.toCursor(response.getCursor());
     }
     Result[] rrs = ResponseConverter.getResults(getRpcControllerCellScanner(), response);
-    if (logScannerActivity) {
-      long now = System.currentTimeMillis();
-      if (now - timestamp > logCutOffLatency) {
-        int rows = rrs == null ? 0 : rrs.length;
-        LOG.info("Took " + (now - timestamp) + "ms to fetch " + rows + " rows from scanner="
-            + scannerId);
-      }
+    int num_rows = rrs == null ? 0 : rrs.length;
+    if (isRetry && !isHeartBeat && num_rows == 0) {
+      // It is possible that the RPC before retry resulted in a DoNotRetryIOException
+      // but due to connection issues the client didn't get it and thrown a retriable
+      // connection exception. In this case the scanner is already closed on the
+      // server side and will return empty results on the retry attempt. This
+      // should lead to resetting the scanner instead of considering it finished.
+      LOG.info("Unexpected empty result on retried scan RPC. Resetting scanner {}",
+          this.scannerId);
+      throw new ScannerResetException(
+          "Resetting the scanner -- unexpected empty result on retried scan RPC.");
     }
+
     updateServerSideMetrics(scanMetrics, response);
     // moreResults is only used for the case where a filter exhausts all elements
     if (response.hasMoreResults()) {
