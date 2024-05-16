@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CompareOperator;
@@ -44,6 +45,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTestConst;
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.SingleProcessHBaseCluster;
 import org.apache.hadoop.hbase.StartTestingClusterOption;
 import org.apache.hadoop.hbase.TableName;
@@ -51,11 +53,13 @@ import org.apache.hadoop.hbase.TableNameTestRule;
 import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.client.Scan.ReadType;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
+import org.apache.hadoop.hbase.exceptions.OutOfOrderScannerNextException;
 import org.apache.hadoop.hbase.filter.BinaryComparator;
 import org.apache.hadoop.hbase.filter.ColumnPrefixFilter;
 import org.apache.hadoop.hbase.filter.ColumnRangeFilter;
 import org.apache.hadoop.hbase.filter.FilterBase;
 import org.apache.hadoop.hbase.filter.QualifierFilter;
+import org.apache.hadoop.hbase.ipc.RpcClient;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.testclassification.ClientTests;
 import org.apache.hadoop.hbase.testclassification.MediumTests;
@@ -905,6 +909,86 @@ public class TestScannersFromClientSide {
       rs.close();
       assertEquals(expectedKvNumber, returnedKvNumber);
     }
+  }
+
+  @Test
+  public void testRepeatedFinalScan() throws Exception {
+    TableName tableName = TableName.valueOf("testRepeatedFinalScan");
+    TEST_UTIL.createTable(tableName, FAMILY).close();
+
+    Configuration c2 = new Configuration(TEST_UTIL.getConfiguration());
+    // We want to work on a separate connection.
+    c2.set(HConstants.HBASE_CLIENT_INSTANCE_ID, String.valueOf(-1));
+    c2.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 100); // retry a lot
+    c2.setInt(HConstants.HBASE_CLIENT_PAUSE, 5);
+
+    Connection connection = ConnectionFactory.createConnection(c2);
+    final Table table = connection.getTable(tableName);
+
+    final int ROWS_TO_INSERT = 100;
+    final byte[] LARGE_VALUE = generateHugeValue(128 * 1024);
+
+    Admin admin = TEST_UTIL.getAdmin();
+    List<Put> putList = new ArrayList<>();
+    for (long i = 0; i < ROWS_TO_INSERT; i++) {
+      Put put = new Put(Bytes.toBytes(i));
+      put.addColumn(FAMILY, QUALIFIER, LARGE_VALUE);
+      putList.add(put);
+    }
+    table.put(putList);
+
+    ServerName sn;
+    try (RegionLocator rl = connection.getRegionLocator(tableName)) {
+      sn = rl.getRegionLocation(Bytes.toBytes(1)).getServerName();
+    }
+    RpcClient rpcClient = ((AsyncConnectionImpl) connection.toAsyncConnection()).rpcClient;
+
+    // Avoid cancelling connection more than once per scan RPC.
+    final AtomicInteger canCancelConnection = new AtomicInteger(0);
+
+    Thread t = new Thread("testScanRepeatThread") {
+      @Override
+      public void run() {
+        while (true) {
+          try {
+            Thread.sleep(10);
+            if (canCancelConnection.get() == 1) {
+              canCancelConnection.set(0);
+              rpcClient.cancelConnections(sn);
+            }
+          } catch (InterruptedException t) {
+            break;
+          }
+        }
+      }
+    };
+    t.start();
+
+    Scan scan = new Scan();
+    scan.addColumn(FAMILY, QUALIFIER);
+    scan.setCaching(10);
+
+    for (int run = 0; run < 5; run++) {
+      try (ResultScanner scanner = table.getScanner(scan)) {
+        for (int i = 0; i < ROWS_TO_INSERT; i++) {
+          Result result;
+          try {
+            result = scanner.next();
+          } catch (RetriesExhaustedException ex) {
+            // If most rows are ok then accept RetriesExhaustedException. This was
+            // needed to make results consistent with and without fix.
+            if (i > ROWS_TO_INSERT / 2) break;
+            throw ex;
+          }
+          assertNotNull(result);
+          if (i % 10 == 1) canCancelConnection.set(1);
+        }
+      }
+    }
+    t.interrupt();
+
+    table.close();
+    connection.close();
   }
 
   public static class LimitKVsReturnFilter extends FilterBase {

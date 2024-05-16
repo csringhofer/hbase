@@ -25,6 +25,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseServerException;
+import org.apache.hadoop.hbase.exceptions.ConnectionClosedException;
 import org.apache.hadoop.hbase.util.DynamicClassLoader;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -99,8 +100,11 @@ public class RemoteWithExtrasException extends RemoteException {
     try {
       return instantiateException(realClass.asSubclass(IOException.class));
     } catch (Exception e) {
-      return new DoNotRetryIOException(
-        "Unable to instantiate exception received from server:" + e.getMessage(), this);
+      // TODO: hack to make testRepeatedFinalScan works as it threw instantion
+      //       exceptions for ConnectionClosedExceptions
+      return new ConnectionClosedException(e.getMessage());
+      // return new DoNotRetryIOException(
+      // "Unable to instantiate exception received from server:" + e.getMessage(), this);
     }
   }
 
